@@ -1,10 +1,11 @@
 # CollectionCounter
 Counting the Movies in collections
 
-Tested on iPhone/iPad Jellyfin App
-Tested on Browser
-Tested with AndroidTV Jellyfin App
-Tested with AppleTV
+Tested on iPhone/iPad Jellyfin App,
+Tested on Browser,
+Tested with AndroidTV Jellyfin App,
+Tested with AppleTV.
+
 Didn'd work on some AndroidTV
 Didn'd work an Apps from AppleTV
 
