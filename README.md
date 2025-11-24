@@ -1,6 +1,13 @@
 # CollectionCounter
 Counting the Movies in collections
 
+Tested on iPhone/iPad Jellyfin App
+Tested on Browser
+Tested with AndroidTV Jellyfin App
+Tested with AppleTV
+Didn'd work on some AndroidTV
+Didn'd work an Apps from AppleTV
+
 In Movie collections, a circle is still displayed in the upper right corner showing the number of unwatched movies. 
 
 The script displays a red circle in the upper left corner showing the number of movies in the collection. 
