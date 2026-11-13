@@ -1,0 +1,440 @@
+
+// == Jellyfin 12.x - CollectionCounter.js ==
+// Zeigt die Anzahl der Filme ausschließlich bei Collections.
+
+(async function () {
+  'use strict';
+
+  const SERVER_URL = 'http://192.168.10.22:8096';
+  const CARD_SELECTOR = '.cardScalable';
+  const BADGE_CLASS = 'collection-count-badge-js';
+  const CACHE_TTL_MS = 5 * 60 * 1000;
+
+  const cache = new Map();
+  const pending = new Map();
+  const loggedTypes = new Set();
+
+  console.log('CollectionCounter startet...');
+
+  // --- Vorherige Instanz beenden ---
+  if (window.__collectionCounterStop) {
+    window.__collectionCounterStop();
+  }
+
+  let active = true;
+  let observer = null;
+
+  window.__collectionCounterStop = function () {
+    active = false;
+    if (observer) observer.disconnect();
+  };
+
+  // --- Badge CSS ---
+  if (!document.getElementById('collection-count-badge-js-style')) {
+    const style = document.createElement('style');
+    style.id = 'collection-count-badge-js-style';
+    style.textContent = `
+      .${BADGE_CLASS} {
+        position: absolute;
+        top: 6px;
+        left: 6px;
+        min-width: 30px;
+        height: 30px;
+        padding: 0 4px;
+        box-sizing: border-box;
+        border-radius: 50%;
+        background: #ff3b30;
+        color: #fff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 13px;
+        line-height: 1;
+        z-index: 99999;
+        pointer-events: none;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // --- API-Client ---
+  function getClient() {
+    return window.ApiClient || window.JellyfinClient || null;
+  }
+
+  function getToken() {
+    try {
+      const client = getClient();
+      return client && typeof client.accessToken === 'function'
+        ? client.accessToken()
+        : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function getServerUrl() {
+    try {
+      const client = getClient();
+      if (client && typeof client.serverAddress === 'function') {
+        return client.serverAddress().replace(/\/$/, '');
+      }
+    } catch (e) {}
+
+    return SERVER_URL.replace(/\/$/, '');
+  }
+
+  async function apiGet(path, token) {
+    const url = getServerUrl() + path;
+
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': 'MediaBrowser Token="' + token + '"',
+        'Accept': 'application/json'
+      },
+      credentials: 'same-origin'
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        'Jellyfin API HTTP ' + response.status + ': ' + path
+      );
+    }
+
+    return response.json();
+  }
+
+  // --- ID aus einer Karte ermitteln ---
+  function extractIdFromCard(card) {
+    if (!card) return null;
+
+    try {
+      const data = card.dataset || {};
+
+      if (data.itemid || data.itemId || data.id || data.folderid) {
+        return data.itemid || data.itemId ||
+               data.id || data.folderid;
+      }
+
+      const parent = card.closest('[data-id], [data-itemid]');
+      if (parent) {
+        const p = parent.dataset;
+        if (p.itemid || p.id) return p.itemid || p.id;
+      }
+
+      const link = card.querySelector(
+        'a[href*="id="], a[href*="details"]'
+      ) || card.closest('a[href*="id="]');
+
+      if (link) {
+        const href = link.getAttribute('href') || '';
+        const match = href.match(/[?&#]id=([^&#]+)/i);
+        if (match) return decodeURIComponent(match[1]);
+      }
+    } catch (e) {
+      console.warn('CollectionCounter: ID-Fehler', e);
+    }
+
+    return null;
+  }
+
+  // --- Bereiche ohne Badges ---
+  const SKIP_SECTION_KEYWORDS = [
+    'continue',
+    'weiterschau',
+    'weiter ansehen',
+    'recent',
+    'kürzlich',
+    'kuerzlich',
+    'recently',
+    'recommended',
+    'empfohlen',
+    'recommend',
+    'vorgeschlagen',
+    'als nächstes',
+    'als naechstes',
+    'next up',
+    'continue watching',
+    'watch next',
+    'recently added',
+    'zuletzt',
+    'top picks'
+  ];
+
+  function getNearestSectionTitle(card) {
+    let el = card;
+
+    for (let i = 0; i < 8 && el; i++) {
+      const heading = el.querySelector && el.querySelector(
+        'h1, h2, h3, h4, .sectionTitle, ' +
+        '.panel-title, .carousel-title'
+      );
+
+      if (heading) {
+        const title = (heading.textContent || '').trim();
+        if (title && title.length < 100) {
+          return title.toLowerCase();
+        }
+      }
+
+      if (el.previousElementSibling) {
+        const prev = el.previousElementSibling;
+        const title = (prev.textContent || '').trim();
+
+        if (title && title.length < 60) {
+          return title.toLowerCase();
+        }
+      }
+
+      el = el.parentElement;
+    }
+
+    return null;
+  }
+
+  function isInSkippedSection(card) {
+    try {
+      const title = getNearestSectionTitle(card);
+      if (!title) return false;
+
+      return SKIP_SECTION_KEYWORDS.some(function (keyword) {
+        return title.includes(keyword);
+      });
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // --- Ausschließlich echte Collections ---
+  async function fetchMovieCountForCollection(id, token) {
+    if (!id) return 0;
+
+    const cached = cache.get(id);
+
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+      return cached.count;
+    }
+
+    // Gleichzeitige Anfragen für dieselbe ID vermeiden
+    if (pending.has(id)) {
+      return pending.get(id);
+    }
+
+    const request = (async function () {
+      try {
+        const details = await apiGet(
+          '/Items/' + encodeURIComponent(id),
+          token
+        );
+
+        const type = String(details.Type || '').toLowerCase();
+
+        // Jellyfin Collections haben den Typ BoxSet.
+        // Alle anderen Item-Typen ignorieren.
+        if (type !== 'boxset') {
+          cache.set(id, {
+            count: 0,
+            ts: Date.now()
+          });
+          return 0;
+        }
+
+        if (!loggedTypes.has(type)) {
+          loggedTypes.add(type);
+          console.log('CollectionCounter: BoxSet erkannt');
+        }
+
+        // Direkte Mitglieder laden und ausschließlich
+        // Filme zählen. Ohne IncludeItemTypes-Filter,
+        // damit Recursive=false eindeutig bleibt.
+        const listData = await apiGet(
+          '/Items?ParentId=' + encodeURIComponent(id) +
+          '&Recursive=false&Limit=10000',
+          token
+        );
+
+        let movieCount = 0;
+
+        if (listData && Array.isArray(listData.Items)) {
+          movieCount = listData.Items.filter(function (item) {
+            return item.Type === 'Movie';
+          }).length;
+        }
+
+        cache.set(id, {
+          count: movieCount,
+          ts: Date.now()
+        });
+
+        if (movieCount > 0) {
+          console.log(
+            'CollectionCounter:',
+            details.Name || id,
+            '- Filme:',
+            movieCount
+          );
+        }
+
+        return movieCount;
+
+      } catch (error) {
+        console.error(
+          'CollectionCounter: API-Fehler bei ' + id,
+          error
+        );
+        return 0;
+      }
+    })();
+
+    pending.set(id, request);
+
+    try {
+      return await request;
+    } finally {
+      pending.delete(id);
+    }
+  }
+
+  // --- Badge anzeigen ---
+  function attachBadge(card, count) {
+    if (!active || !card || !card.isConnected) return;
+    if (count <= 0) return;
+    if (isInSkippedSection(card)) return;
+
+    let badge = card.querySelector('.' + BADGE_CLASS);
+
+    if (!badge) {
+      if (getComputedStyle(card).position === 'static') {
+        card.style.position = 'relative';
+      }
+
+      badge = document.createElement('div');
+      badge.className = BADGE_CLASS;
+      card.appendChild(badge);
+    }
+
+    badge.textContent = String(count);
+  }
+
+  // --- Einzelne Karte überprüfen ---
+  async function annotateCard(card, token) {
+    if (!active || !card || !card.isConnected) return;
+    if (isInSkippedSection(card)) return;
+
+    const id = extractIdFromCard(card);
+    if (!id) return;
+
+    // Verhindert doppelte Verarbeitung derselben ID.
+    if (card.dataset.collectionCounterId === id) {
+      return;
+    }
+
+    const count = await fetchMovieCountForCollection(
+      id, token
+    );
+
+    if (!active || !card.isConnected) return;
+
+    // Karte könnte inzwischen für ein anderes Item
+    // wiederverwendet worden sein.
+    if (extractIdFromCard(card) !== id) return;
+
+    card.dataset.collectionCounterId = id;
+
+    const oldBadge = card.querySelector('.' + BADGE_CLASS);
+
+    if (count > 0) {
+      attachBadge(card, count);
+    } else if (oldBadge) {
+      oldBadge.remove();
+    }
+  }
+
+  // --- Alle vorhandenen Karten verarbeiten ---
+  function annotateAll(token) {
+    const cards = document.querySelectorAll(CARD_SELECTOR);
+
+    console.log(
+      'CollectionCounter: Karten gefunden:',
+      cards.length
+    );
+
+    Array.from(cards).forEach(function (card, index) {
+      setTimeout(function () {
+        if (active) {
+          annotateCard(card, token).catch(console.error);
+        }
+      }, index * 60);
+    });
+  }
+
+  // --- Nachgeladene Karten erkennen ---
+  function observeMutations(token) {
+    observer = new MutationObserver(function (mutations) {
+      if (!active) return;
+
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType !== 1) continue;
+
+          // Direkt hinzugefügte Karte
+          if (node.matches && node.matches(CARD_SELECTOR)) {
+            annotateCard(node, token).catch(console.error);
+          }
+
+          // Karten innerhalb eines neuen Elements
+          if (node.querySelectorAll) {
+            const found = node.querySelectorAll(CARD_SELECTOR);
+
+            for (const card of found) {
+              annotateCard(card, token).catch(console.error);
+            }
+          }
+        }
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  // --- Auf Jellyfin-Anmeldung warten ---
+  async function waitForToken(timeout = 15000) {
+    const start = Date.now();
+
+    while (Date.now() - start < timeout) {
+      const token = getToken();
+
+      if (token) return token;
+
+      await new Promise(function (resolve) {
+        setTimeout(resolve, 200);
+      });
+    }
+
+    return null;
+  }
+
+  // --- Skript starten ---
+  const token = await waitForToken();
+
+  if (!active) return;
+
+  if (!token) {
+    console.error(
+      'CollectionCounter: Kein Jellyfin-Token gefunden.'
+    );
+    return;
+  }
+
+  console.log('CollectionCounter: Anmeldung erkannt.');
+
+  annotateAll(token);
+  observeMutations(token);
+
+  console.log('CollectionCounter: Aktiv.');
+
+})();
